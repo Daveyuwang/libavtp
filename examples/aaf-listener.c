@@ -123,8 +123,13 @@ static error_t parser(int key, char *arg, struct argp_state *state)
 
 static struct argp argp = { options, parser };
 
-/* Schedule 'pcm_sample' to be presented at time specified by 'tspec'. */
-static int schedule_sample(int fd, struct timespec *tspec, uint8_t *pcm_sample)
+/* 
+ * Modified schedule_sample:
+ * Instead of arming a one-shot timer for each new head of the queue, 
+ * samples are simply enqueued. The periodic timer (configured in main())
+ * will trigger the timeout() function to process and present due samples.
+ */
+static int schedule_sample(int timer_fd, struct timespec *tspec, uint8_t *pcm_sample)
 {
 	struct sample_entry *entry;
 
@@ -134,26 +139,15 @@ static int schedule_sample(int fd, struct timespec *tspec, uint8_t *pcm_sample)
 		return -1;
 	}
 
+	// Copy presentation time and PCM sample into the new entry.
 	entry->tspec.tv_sec = tspec->tv_sec;
 	entry->tspec.tv_nsec = tspec->tv_nsec;
 	memcpy(entry->pcm_sample, pcm_sample, DATA_LEN);
 
+	// Insert new sample into the tail of the sample queue.
 	STAILQ_INSERT_TAIL(&samples, entry, entries);
 
-	/* If this was the first entry inserted onto the queue, we need to arm
-	 * the timer.
-	 */
-	if (STAILQ_FIRST(&samples) == entry) {
-		int res;
-
-		res = arm_timer(fd, tspec);
-		if (res < 0) {
-			STAILQ_REMOVE(&samples, entry, sample_entry, entries);
-			free(entry);
-			return -1;
-		}
-	}
-
+	// Removed individual timer arm call since we now use a periodic timer.
 	return 0;
 }
 
@@ -333,37 +327,48 @@ static int new_packet(int sk_fd, int timer_fd)
 	return 0;
 }
 
-static int timeout(int fd)
+/*
+ * Modified timeout function:
+ * Instead of processing a single sample and rearming the timer,
+ * this periodic timeout() function processes all samples in the queue
+ * that are due for presentation (i.e. whose scheduled time is <= current time).
+ */
+static int timeout(int timer_fd)
 {
 	int res;
 	ssize_t n;
 	uint64_t expirations;
 	struct sample_entry *entry;
+	struct timespec now;
 
-	n = read(fd, &expirations, sizeof(uint64_t));
+	// Read the number of expirations (in case multiple timer events accumulate).
+	n = read(timer_fd, &expirations, sizeof(uint64_t));
 	if (n < 0) {
 		perror("Failed to read timerfd");
 		return -1;
 	}
 
-	assert(expirations == 1);
-
-	entry = STAILQ_FIRST(&samples);
-	assert(entry != NULL);
-
-	res = present_data(entry->pcm_sample, DATA_LEN);
-	if (res < 0)
+	// Obtain the current system time.
+	if (clock_gettime(CLOCK_REALTIME, &now) < 0) {
+		perror("Failed to get current time");
 		return -1;
+	}
 
-	STAILQ_REMOVE_HEAD(&samples, entries);
-	free(entry);
-
-	if (!STAILQ_EMPTY(&samples)) {
+	// Process all queued samples that are due for presentation.
+	while (!STAILQ_EMPTY(&samples)) {
 		entry = STAILQ_FIRST(&samples);
-
-		res = arm_timer(fd, &entry->tspec);
-		if (res < 0)
-			return -1;
+		// Check if the sample's scheduled time is in the past (or now).
+		if ((entry->tspec.tv_sec < now.tv_sec) ||
+			(entry->tspec.tv_sec == now.tv_sec && entry->tspec.tv_nsec <= now.tv_nsec)) {
+			res = present_data(entry->pcm_sample, DATA_LEN);
+			if (res < 0)
+				return -1;
+			STAILQ_REMOVE_HEAD(&samples, entries);
+			free(entry);
+		} else {
+			// The head sample is not due yet; exit the loop.
+			break;
+		}
 	}
 
 	return 0;
@@ -385,6 +390,25 @@ int main(int argc, char *argv[])
 	timer_fd = timerfd_create(CLOCK_REALTIME, 0);
 	if (timer_fd < 0) {
 		close(sk_fd);
+		return 1;
+	}
+
+	/* Configure timer_fd as a periodic timer with a 10ms interval.
+	 * This periodic timer helps aggregate the presentation 
+	 * of samples and reduces timer re-arming overhead.
+	 */
+	struct itimerspec timer_spec;
+	// Set the initial expiration to 10ms.
+	timer_spec.it_value.tv_sec = 0;
+	timer_spec.it_value.tv_nsec = 10 * 1000000; // 10ms in nanoseconds.
+	// Set the interval to 10ms.
+	timer_spec.it_interval.tv_sec = 0;
+	timer_spec.it_interval.tv_nsec = 10 * 1000000;
+	
+	if (timerfd_settime(timer_fd, 0, &timer_spec, NULL) < 0) {
+		perror("Failed to set periodic timer");
+		close(sk_fd);
+		close(timer_fd);
 		return 1;
 	}
 
