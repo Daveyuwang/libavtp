@@ -293,6 +293,7 @@ static int new_packet(int sk_fd, int timer_fd)
 {
 	int res;
 	ssize_t n;
+	uint64_t avtp_time;
 	struct timespec tspec;
 	struct avtp_stream_pdu *pdu = alloca(PDU_SIZE);
 
@@ -309,19 +310,15 @@ static int new_packet(int sk_fd, int timer_fd)
 		return 0;
 	}
 
-	// Instead of waiting for 20ms (or using get_presentation_time),
-	// immediately schedule sample playback by using the current system time
-	if (clock_gettime(CLOCK_REALTIME, &tspec) < 0) {
-	    perror("DEBUG: clock_gettime failed");
-	    return -1;
+	res = avtp_aaf_pdu_get(pdu, AVTP_AAF_FIELD_TIMESTAMP, &avtp_time);
+	if (res < 0) {
+		fprintf(stderr, "Failed to get AVTP time from PDU\n");
+		return -1;
 	}
-	// Add a minimal delay (1ms) to ensure the sample is due for output
-	tspec.tv_nsec += 1 * 1000000;  // add 1ms delay
-	if (tspec.tv_nsec >= NSEC_PER_SEC) {
-	    tspec.tv_sec += tspec.tv_nsec / NSEC_PER_SEC;
-	    tspec.tv_nsec %= NSEC_PER_SEC;
-	}
-	fprintf(stderr, "DEBUG: new_packet: Scheduled sample playback at %ld.%09ld\n", tspec.tv_sec, tspec.tv_nsec);
+
+	res = get_presentation_time(avtp_time, &tspec);
+	if (res < 0)
+		return -1;
 
 	res = schedule_sample(timer_fd, &tspec, pdu->avtp_payload);
 	if (res < 0)
@@ -419,8 +416,6 @@ int main(int argc, char *argv[])
 	fds[0].events = POLLIN;
 	fds[1].fd = timer_fd;
 	fds[1].events = POLLIN;
-
-	fprintf(stderr, "DEBUG: Starting AAF Listener\n");
 
 	while (1) {
 		res = poll(fds, 2, -1);
